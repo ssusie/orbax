@@ -921,7 +921,7 @@ def broadcast_one_replica_to_all(
         factor = 4
       params_per_device[dev_id] = (
         num_p + np.prod(shard.data.shape),
-        gb + factor * 3 * np.prod(shard.data.shape) // 10**9
+        gb + factor * np.prod(shard.data.shape) // 10**9
       )
 
     jax.tree_util.tree_map(calc_shard_params, inp.addressable_shards)

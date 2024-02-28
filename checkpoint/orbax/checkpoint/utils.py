@@ -27,6 +27,7 @@ import time
 from typing import Any, List, Optional, Tuple, Union
 
 from absl import logging
+from collections import defaultdict
 from etils import epath
 import jax
 from jax.experimental import multihost_utils
@@ -65,15 +66,7 @@ def sync_global_devices(name: str):
   """Thin wrapper to provide additional features support."""
   if should_skip_device_sync():
     return
-  sync_start_time = time.time()
   multihost_utils.sync_global_devices(name)
-  # This may end up just being too noisy given how many barriers there are, but
-  # it does represent how long different processes waited around waiting for
-  # other processes to reach a barrier.
-  jax.monitoring.record_event_duration_secs(
-      '/jax/checkpoint/sync_global_devices_duration_sec',
-      time.time() - sync_start_time,
-  )
 
 
 def broadcast_one_to_all(pytree: PyTree) -> PyTree:
@@ -848,9 +841,7 @@ def to_shape_dtype_struct(x, dtype=None, scalar_dtype=None):
     return jax.ShapeDtypeStruct(
         shape=x.shape,
         dtype=dtype if dtype is not None else x.dtype,
-        sharding=x.sharding
-        if isinstance(x.sharding, jax.sharding.Sharding)
-        else x.sharding.to_jax_sharding(),
+        sharding=x.sharding,
     )
   elif isinstance(x, jax.Array):
     dtype = dtype or x.dtype
@@ -869,9 +860,7 @@ def to_shape_dtype_struct(x, dtype=None, scalar_dtype=None):
     return jax.ShapeDtypeStruct(
         shape=x.shape,
         dtype=dtype,
-        sharding=x.sharding
-        if isinstance(x.sharding, jax.sharding.Sharding)
-        else x.sharding.to_jax_sharding(),
+        sharding=x.sharding,
     )
   else:
     raise ValueError(f'Unexpected type: {type(x)}.')
@@ -887,6 +876,13 @@ def fake_zero_data(sharding, x):
   return jax.lax.with_sharding_constraint(x, sharding)
 
 
+def calculate_num_params_from_pytree(params):
+  params_sizes = jax.tree_util.tree_map(jax.numpy.size, params)
+  total_parameters = jax.tree_util.tree_reduce(lambda x, y: x + y, params_sizes)
+  assert total_parameters >= 0
+  return total_parameters
+
+
 def broadcast_one_replica_to_all(
     in_tree: Tuple[PyTree, ...],
     global_mesh: jax.sharding.Mesh,
@@ -897,13 +893,46 @@ def broadcast_one_replica_to_all(
   """One replica reads the data and broadcasts to others."""
   num_replicas = global_mesh.devices.shape[replica_axis_index]
   replica_axis_name = global_mesh.axis_names[replica_axis_index]
-
+  params_per_device = defaultdict(lambda: (0, 0.0))
   def pre_jit(x, per_replica_sharding):
+    print('pre_jit: x shape', x.shape)
     if is_source:
       inp = x
     else:
       inp = fake_zero_data(per_replica_sharding, x)
-    inp = jnp.expand_dims(inp, axis=replica_axis_index)
+      # print('pre_jit: not source inp shape and dtype', inp.shape, inp.dtype)
+      # print('pre_jit: not source num params',
+      #       calculate_num_params_from_pytree(inp))
+    print('pre_jit: inp shape', inp.shape, inp.dtype)
+    print('pre_jit: per replica sharding', per_replica_sharding)
+    num_params = calculate_num_params_from_pytree(inp)
+    print('pre_jit: num params', num_params)
+    def calc_shard_params(shard):
+      dev_id = shard.device.id
+      num_p, gb = params_per_device[dev_id]
+      num_p += np.prod(shard.data.shape)
+      if shard.data.dtype == jax.numpy.bfloat16:
+        factor = 2
+      elif shard.data.dtype == jax.numpy.float32:
+        factor = 4
+      elif shard.data.dtype == jax.numpy.float64:
+        factor = 8
+      elif shard.data.dtype == jax.numpy.int32:
+        factor = 4
+      params_per_device[dev_id] = (
+        num_p + np.prod(shard.data.shape),
+        gb + factor * 3 * np.prod(shard.data.shape) // 10**9
+      )
+
+    jax.tree_util.tree_map(calc_shard_params, inp.addressable_shards)
+    print('SS: pre_jit: params_per_device', params_per_device)
+    # print('pre_jit: expand inp dim num params', num_params)
+    try:
+      inp = jnp.expand_dims(inp, axis=replica_axis_index)
+    except:
+      print('SS: Failing pre_jit: params_per_device', params_per_device)
+    # print('pre_jit: expand inp dim', inp.shape)
+
     in_spec = jax.sharding.PartitionSpec(
         *x.sharding.spec[:replica_axis_index],
         replica_axis_name,

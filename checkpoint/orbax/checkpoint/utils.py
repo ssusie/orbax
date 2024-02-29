@@ -882,6 +882,23 @@ def calculate_num_params_from_pytree(params):
   assert total_parameters >= 0
   return total_parameters
 
+def get_bytes_per_param(data):
+  if data.dtype == jax.numpy.bfloat16:
+    bytes_per_param = 2
+  elif data.dtype == jax.numpy.float32:
+    bytes_per_param = 4
+  elif data.dtype == jax.numpy.float64:
+    bytes_per_param = 8
+  elif data.dtype == jax.numpy.int32:
+    bytes_per_param = 4
+  else:
+    raise TypeError(f'data dtype {data.dtype} not defined'
+                    ' in `get_bytes_per_param`')
+  return bytes_per_param
+
+def calc_size_in_gb(data):
+  bytes_per_param = get_bytes_per_param(data)
+  return np.prod(data.shape) * bytes_per_param / 1e9
 
 def broadcast_one_replica_to_all(
     in_tree: Tuple[PyTree, ...],
@@ -895,7 +912,7 @@ def broadcast_one_replica_to_all(
   replica_axis_name = global_mesh.axis_names[replica_axis_index]
   params_per_device = defaultdict(lambda: (0, 0.0))
   def pre_jit(x, per_replica_sharding):
-    print('pre_jit: x shape', x.shape)
+    # print('pre_jit: x shape', x.shape)
     if is_source:
       inp = x
     else:
@@ -906,26 +923,32 @@ def broadcast_one_replica_to_all(
     print('pre_jit: inp shape', inp.shape, inp.dtype)
     print('pre_jit: per replica sharding', per_replica_sharding)
     num_params = calculate_num_params_from_pytree(inp)
-    print('pre_jit: num params', num_params)
+    expected_per_device_num_param = num_params // 64
+    expected_size_increase = expected_per_device_num_param * get_bytes_per_param(inp) / 1e9
+    print('pre_jit: num params in current inp', num_params)
+    print('pre_jit: current inp size in GB', calc_size_in_gb(inp))
+    print('pre_jit: expected per device size increase', expected_size_increase)
     def calc_shard_params(shard):
       dev_id = shard.device.id
-      num_p, gb = params_per_device[dev_id]
-      num_p += np.prod(shard.data.shape)
-      if shard.data.dtype == jax.numpy.bfloat16:
-        factor = 2
-      elif shard.data.dtype == jax.numpy.float32:
-        factor = 4
-      elif shard.data.dtype == jax.numpy.float64:
-        factor = 8
-      elif shard.data.dtype == jax.numpy.int32:
-        factor = 4
+      num_p, size_gb = params_per_device[dev_id]
+      new_num_p = np.prod(shard.data.shape)
+
+      if new_num_p == expected_per_device_num_param:
+        print('Input is sharded over 64 devices as expected!!!')
+      else:
+        print('Expected %d params but got %d' % (expected_per_device_num_param,
+                                                 new_num_p) )
+        print('Off by a factor of', new_num_p // expected_per_device_num_param)
+
+      print(f'expected to increase size by {expected_size_increase} GB ',
+            f'actually increased by {new_num_p * get_bytes_per_param(shard.data) / 1e9} GB')
       params_per_device[dev_id] = (
-        num_p + np.prod(shard.data.shape),
-        gb + factor * np.prod(shard.data.shape) // 10**9
+        num_p + new_num_p,
+        size_gb + calc_size_in_gb(shard.data)
       )
 
     jax.tree_util.tree_map(calc_shard_params, inp.addressable_shards)
-    print('SS: pre_jit: params_per_device', params_per_device)
+    print('SS: pre_jit: device_id: (num_params, size_in_GB)', params_per_device)
     # print('pre_jit: expand inp dim num params', num_params)
     try:
       inp = jnp.expand_dims(inp, axis=replica_axis_index)

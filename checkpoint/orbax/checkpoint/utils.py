@@ -553,6 +553,24 @@ def fake_zero_data(sharding, x):
   return jax.lax.with_sharding_constraint(x, sharding)
 
 
+def memory_per_device_gb():
+  bytes_per_param = 4
+  memory_per_chip = bytes_per_param * sum(
+    [np.prod(x.addressable_shards[0].data.shape) for x in jax.live_arrays()]
+    )
+  # memory_per_chip = 0
+  # for x in jax.live_arrays():
+  #   shard = x.addressable_shards[0].data
+  #   if str(shard.dtype) in ('int32', 'uint32', 'float32'):
+  #     bytes_per_param = 4
+  #     memory_per_chip += bytes_per_param * np.prod(shard.shape)
+  #   else:
+  #     logging.info(f'live array type {x.dtype}')
+  #     import sys
+  #     sys.exit()
+  logging.info(f'------ Per chip memory in GB {memory_per_chip // 1e9}-----')
+
+
 def broadcast_one_replica_to_all(
     in_tree: Tuple[PyTree, ...],
     global_mesh: jax.sharding.Mesh,
@@ -564,6 +582,9 @@ def broadcast_one_replica_to_all(
   num_replicas = global_mesh.devices.shape[replica_axis_index]
   replica_axis_name = global_mesh.axis_names[replica_axis_index]
 
+  # import pdb; pdb.set_trace()
+  logging.info('init memory')
+  memory_per_device_gb()
   def pre_jit(x, per_replica_sharding):
     if is_source:
       inp = x
@@ -591,15 +612,21 @@ def broadcast_one_replica_to_all(
       ),
       in_tree,
   )
+  logging.info('after out_sharding')
+  memory_per_device_gb()
   in_tree_sharded = jax.tree_util.tree_map(
       pre_jit, in_tree, per_replica_shardings
   )
   # Delete immediately to conserve memory.
+  logging.info('after in tree sharded')
+  memory_per_device_gb()
   jax.tree_util.tree_map(lambda x: x.delete(), in_tree)
   out_tree = jax.jit(
       functools.partial(_sum, replica_axis_index=replica_axis_index),
       out_shardings=out_sharding,
   )(in_tree_sharded)
+  logging.info('after out tree')
+  memory_per_device_gb()
   jax.block_until_ready(out_tree)
   return out_tree
 

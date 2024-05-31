@@ -567,6 +567,7 @@ def broadcast_one_replica_to_all(
     per_replica_shardings: Tuple[Optional[jax.sharding.NamedSharding], ...],
     replica_axis_index: int,
     is_source: bool,
+    num_broadcasts: int = 4
 ) -> Tuple[PyTree, ...]:
   """One replica reads the data and broadcasts to others."""
   num_replicas = global_mesh.devices.shape[replica_axis_index]
@@ -593,22 +594,28 @@ def broadcast_one_replica_to_all(
         global_shape, global_sharding, [s.data for s in inp.addressable_shards]
     )
 
-  out_sharding = jax.tree.map(
-      lambda x: jax.sharding.NamedSharding(
-          global_mesh, jax.sharding.PartitionSpec(*x.sharding.spec)
-      ),
-      in_tree,
-  )
-  in_tree_sharded = jax.tree.map(
-      pre_jit, in_tree, per_replica_shardings
-  )
-  # Delete immediately to conserve memory.
-  jax.tree.map(lambda x: x.delete(), in_tree)
-  out_tree = jax.jit(
-      functools.partial(_sum, replica_axis_index=replica_axis_index),
-      out_shardings=out_sharding,
-  )(in_tree_sharded)
-  jax.block_until_ready(out_tree)
+  out_tree = []
+  N = len(in_tree)
+  # import pdb; pdb.set_trace()
+  for n in range(num_broadcasts):
+    in_tree_slice = in_tree[n*N//num_broadcasts: (n+1)*N//num_broadcasts]
+    out_sharding_slice = jax.tree.map(
+        lambda x: jax.sharding.NamedSharding(
+            global_mesh, jax.sharding.PartitionSpec(*x.sharding.spec)
+        ),
+        in_tree_slice,
+    )
+    in_tree_sharded_slice = jax.tree.map(
+        pre_jit, in_tree_slice, per_replica_shardings[n*N//num_broadcasts: (n+1)*N//num_broadcasts]
+    )
+    jax.tree.map(lambda x: x.delete(), in_tree_slice)
+    out_tree_slice= jax.jit(
+        functools.partial(_sum, replica_axis_index=replica_axis_index),
+        out_shardings=out_sharding_slice,
+    )(in_tree_sharded_slice)
+    out_tree.extend(out_tree_slice)
+    jax.block_until_ready(out_tree_slice)
+  # pdb.set_trace()
   return out_tree
 
 
